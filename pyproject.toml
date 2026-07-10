@@ -17,6 +17,7 @@ dev = [
     "ruff>=0.11",
     "mypy>=1.15",
     "types-requests",
+    "types-requests-oauthlib",
 ]
 
 [build-system]
@@ -28,6 +29,9 @@ packages = ["src/etrade_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# src on pythonpath directly: tests must not depend on the editable-install .pth,
+# which macOS uv can mark `hidden` and Python >=3.12.11 then silently skips (ADR-0001).
+pythonpath = ["src"]
 # Wall suite (tests/wall/) is excluded from default runs; run explicitly with:
 #   uv run pytest -m wall --override-ini "addopts="
 addopts = "-m 'not wall'"

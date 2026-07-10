@@ -1,0 +1,33 @@
+# Copy to config/config.toml (gitignored) and fill in. SPEC §8.
+#
+# Copying this file as-is WILL NOT START THE SERVER: caps and pilot capital have
+# no defaults (invariant T5) — you must choose the values deliberately, when
+# funding the account. Changing caps/whitelist/policy later = config_version bump
+# + ADR in the same commit (SPEC §8.2).
+
+config_version = 1
+
+[environment]
+mode = "sandbox"            # "prod" only via the sandbox-prod skill checklist
+
+[capital]
+# The isolated, fully-loss-tolerant pilot amount. Required, > 0.
+# pilot_amount_usd = ...
+
+[caps]                      # ALL REQUIRED, NO DEFAULTS (T5)
+# per_trade_pct = ...       # max % of pilot capital per order (0 < x <= 100)
+# daily_trade_limit = ...   # max executed orders per day (integer > 0)
+# daily_loss_pct = ...      # daily loss % that trips the circuit breaker (0 < x <= 100)
+
+[whitelist]
+tier1 = ["SPY", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH"]
+tier2 = []                  # riskier names — future, via config_version bump + ADR
+tier3 = []
+enabled_tiers = ["tier1"]
+
+[policy]
+long_only = true
+allowed_security_types = ["EQ"]
+
+[store]
+db_path = "trading.db"
