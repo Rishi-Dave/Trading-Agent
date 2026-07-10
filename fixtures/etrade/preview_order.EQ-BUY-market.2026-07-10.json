@@ -1,0 +1,61 @@
+{
+  "PreviewOrderResponse": {
+    "Disclosure": {
+      "aoDisclosureFlag": false,
+      "conditionalDisclosureFlag": true,
+      "ehDisclosureFlag": false
+    },
+    "MessageList": {},
+    "Order": [
+      {
+        "Instrument": [
+          {
+            "Product": {
+              "securityType": "EQ",
+              "symbol": "IBM"
+            },
+            "cancelQuantity": 0,
+            "orderAction": "BUY",
+            "quantity": 100,
+            "quantityType": "QUANTITY",
+            "reserveOrder": false,
+            "reserveQuantity": 0,
+            "symbolDescription": ""
+          }
+        ],
+        "allOrNone": false,
+        "egQual": "EG_QUAL_OUTSIDE_GUARANTEED_PERIOD",
+        "estimatedCommission": 6.99,
+        "estimatedFees": 0.0,
+        "gcd": 0,
+        "limitPrice": 0,
+        "marketSession": "REGULAR",
+        "messages": {},
+        "netAsk": 0,
+        "netBid": 0,
+        "netPrice": 0,
+        "orderTerm": "GOOD_FOR_DAY",
+        "priceType": "MARKET",
+        "ratio": "",
+        "stopPrice": 0
+      }
+    ],
+    "PortfolioMargin": {
+      "houseExcessEquityChange": 0.0,
+      "houseExcessEquityCurr": 0.0,
+      "houseExcessEquityNew": 0.0,
+      "pmEligible": false
+    },
+    "PreviewIds": [
+      {
+        "previewId": 1627181131
+      }
+    ],
+    "accountId": "***SCRUBBED***",
+    "dstFlag": false,
+    "marginLevelCd": "MARGIN_TRADING_ALLOWED",
+    "optionLevelCd": 4,
+    "orderType": "EQ",
+    "previewTime": 1354512315217
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "BalanceResponse": {
+    "Cash": {
+      "fundsForOpenOrdersCash": 0.0,
+      "moneyMktBalance": 0.0
+    },
+    "Computed": {
+      "OpenCalls": {
+        "cashCall": 0.0
+      },
+      "RealTimeValues": {
+        "netMv": -454.22,
+        "netMvLong": 0.0,
+        "totalAccountValue": 0.0
+      },
+      "cashAvailableForInvestment": 0.0,
+      "cashAvailableForWithdrawal": 0.0,
+      "cashBalance": 0.0,
+      "fundsWithheldFromPurchasePower": 0.0,
+      "fundsWithheldFromWithdrawal": 0.0,
+      "netCash": -740.450013,
+      "settledCashForInvestment": 0.0,
+      "unSettledCashForInvestment": 0.0
+    },
+    "accountDescription": "",
+    "accountId": "***SCRUBBED***",
+    "accountType": "MARGIN",
+    "optionLevel": "LEVEL_4"
+  }
+}

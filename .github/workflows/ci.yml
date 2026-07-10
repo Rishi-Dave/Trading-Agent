@@ -42,7 +42,9 @@ jobs:
       - run: uv run pytest
 
   # Blocking from day one: the caps wall (gate `caps-required`, SPEC §4.2, T5).
-  # Grows the full try-to-violate-every-cap suite in Phase 2.
+  # Grows the full try-to-violate-every-cap suite in Phase 2. Scoped to exclude
+  # `phase1` (tests/wall/phase1/) so it stays blocking/green regardless of that
+  # wall's state while Phase 1 is open.
   safety-wall:
     runs-on: ubuntu-latest
     steps:
@@ -51,4 +53,17 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked
-      - run: uv run pytest -m wall --override-ini "addopts="
+      - run: uv run pytest -m "wall and not phase1" --override-ini "addopts="
+
+  # Phase 1 wall: fixture replay + schema-drift (SPEC §7 Phase 1 row). Flipped to
+  # blocking at Phase 1 close (docs/decisions/0002-phase1-oauth-and-server-wiring.md,
+  # docs/PHASE1-REPORT.md) — was informational (continue-on-error) while open.
+  phase1-wall:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run pytest -m "wall and phase1" --override-ini "addopts="

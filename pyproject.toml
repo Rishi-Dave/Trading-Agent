@@ -37,6 +37,7 @@ pythonpath = ["src"]
 addopts = "-m 'not wall'"
 markers = [
     "wall: safety wall — cap-violation suite, run explicitly and enforced as a blocking CI job",
+    "phase1: Phase 1 foundation wall (fixture replay + schema-drift, SPEC §7) — a subset of wall; isolated from the day-one-blocking caps wall (see tests/wall/phase1/conftest.py, ci.yml)",
 ]
 
 [tool.ruff]
