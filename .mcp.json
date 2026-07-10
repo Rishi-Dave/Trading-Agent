@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "etrade": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "etrade_agent.server.app"],
+      "env": {}
+    }
+  }
+}
