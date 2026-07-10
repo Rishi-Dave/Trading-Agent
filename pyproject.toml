@@ -1,0 +1,50 @@
+[project]
+name = "etrade-agent"
+version = "0.1.0"
+description = "Capped-autonomy E*Trade trading pilot: MCP server with in-server safety layer + Claude-orchestrated decision pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.9,<2",
+    "pydantic>=2.7,<3",
+    "requests>=2.32,<3",
+    "requests-oauthlib>=2.0,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.11",
+    "mypy>=1.15",
+    "types-requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/etrade_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Wall suite (tests/wall/) is excluded from default runs; run explicitly with:
+#   uv run pytest -m wall --override-ini "addopts="
+addopts = "-m 'not wall'"
+markers = [
+    "wall: safety wall — cap-violation suite, run explicitly and enforced as a blocking CI job",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["etrade_agent"]

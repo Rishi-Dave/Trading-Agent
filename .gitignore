@@ -1,0 +1,29 @@
+# Secrets & account-specific config — never committed (invariant T3/T5)
+.env
+config/config.toml
+tokens/
+*.tokens.json
+
+# Local state
+*.db
+*.db-wal
+*.db-shm
+logs/
+status/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Claude Code local
+.claude/settings.local.json
+.claude/worktrees/
