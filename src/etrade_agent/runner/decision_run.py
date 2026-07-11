@@ -20,7 +20,7 @@ receipt), which is the correct non-silent path.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,8 +28,14 @@ from typing import Any
 from pydantic import ValidationError
 
 from etrade_agent import logs
-from etrade_agent.etrade.models import OrderAction, OrderRequest, OrderType, SecurityType
-from etrade_agent.notify import ntfy
+from etrade_agent.etrade.models import (
+    OrderAction,
+    OrderRequest,
+    OrderType,
+    SecurityType,
+    unrealized_pnl,
+)
+from etrade_agent.notify.ntfy import NotifyFn
 from etrade_agent.pipeline.llm import LLMClient
 from etrade_agent.pipeline.news import NewsSource
 from etrade_agent.pipeline.steps import (
@@ -47,12 +53,12 @@ from etrade_agent.pipeline.steps import (
     run_pipeline,
     signals_to_json,
 )
+from etrade_agent.runner.status import build_status_report, write_status_report_best_effort
 from etrade_agent.server import tools
 from etrade_agent.server.app import Runtime
+from etrade_agent.store.state import today_utc
 
 _AGENT_ID = "etrade-runner"
-
-NotifyFn = Callable[[str, str], None]
 
 
 @dataclass(frozen=True)
@@ -242,6 +248,7 @@ def run_decision(
     news: NewsSource,
     notify: NotifyFn,
     log_dir: Path | None = None,
+    status_dir: Path | None = None,
 ) -> RunSummary | None:
     """The full fetch -> pipeline -> execute -> log -> notify loop (SPEC §9).
 
@@ -253,12 +260,27 @@ def run_decision(
     `rt.client` (an EtradeClient) is passed as the pipeline's MarketDataSource
     seam (get_quote/get_positions/get_balances) — it satisfies that Protocol
     structurally, per pipeline/market.py, with no changes needed there.
+
+    `status_dir`, like `log_dir`, is optional (Phase 5, SPEC §9): when given,
+    a status/<run_id>.json report is written on every path this function can
+    return through, best-effort — an observability failure here must never
+    turn an otherwise-successful (or already-skipped) run into a failure
+    (ADR-0006 Step 0 #2).
     """
+    start = time.monotonic()
     if rt.state.is_kill_engaged():
         logs.log(
             _AGENT_ID, "warning", "kill switch engaged; skipping decision run", run_id=rt.run_id
         )
         notify("Decision run skipped", f"kill switch is engaged (run {rt.run_id})")
+        if status_dir is not None:
+            report = build_status_report(
+                rt.run_id,
+                None,
+                stage="skipped-kill-switch",
+                duration_seconds=time.monotonic() - start,
+            )
+            write_status_report_best_effort(status_dir, rt.run_id, report)
         return None
 
     symbols = sorted(rt.config.whitelist.enabled_symbols())
@@ -283,24 +305,44 @@ def run_decision(
         f"{summary.executed_count} executed, {summary.refused_count} refused, "
         f"{summary.orders_skipped} skipped (of {summary.decisions_considered} decisions)",
     )
+
+    try:
+        _send_daily_digest(rt, notify)
+    except Exception as exc:  # observability must never fail an otherwise-successful run
+        logs.log(_AGENT_ID, "warning", "daily digest failed to build/send", error=str(exc))
+
+    if status_dir is not None:
+        report = build_status_report(
+            rt.run_id, summary, stage="completed", duration_seconds=time.monotonic() - start
+        )
+        write_status_report_best_effort(status_dir, rt.run_id, report)
+
     return summary
 
 
-def build_notify(topic: str | None) -> NotifyFn:
-    """The production NotifyFn (SPEC §9): posts via notify.ntfy.send when
-    NTFY_TOPIC is configured. A missing topic or a send failure must never
-    abort a run — by the time this is called the trade/refusal already
-    happened (or didn't); a missed notification is a monitoring gap, not a
-    reason to fail the run (notify/ntfy.py's own docstring: callers decide
-    whether a missed notification is fatal — here, it never is)."""
+def _send_daily_digest(rt: Runtime, notify: NotifyFn) -> None:
+    """SPEC §9's daily digest (trades, P&L, caps remaining) — ADR-0006 Step 0
+    #1: store-backed, not the in-memory RunSummary, so a day with a re-run or
+    a manual `.mcp.json` place_order still produces an accurate day-level
+    number, and fired at the end of run_decision's happy path (cheapest
+    trigger point, reuses this run's already-open Runtime).
 
-    def _notify(title: str, message: str) -> None:
-        if not topic:
-            logs.log(_AGENT_ID, "warning", "NTFY_TOPIC not set; skipping notification", title=title)
-            return
-        try:
-            ntfy.send(topic, title, message)
-        except Exception as exc:  # a notification outage must not abort the run
-            logs.log(_AGENT_ID, "warning", "notification send failed", error=str(exc), title=title)
-
-    return _notify
+    P&L (ADR-0006 Step 0 #4): reports LIVE unrealized P&L (the identical
+    calculation the loss-breaker gate itself uses, etrade.models.unrealized_pnl)
+    labeled as such, and states plainly that realized P&L isn't tracked yet
+    (ADR-0005 point 3) rather than printing a misleading $0.00.
+    """
+    day = today_utc()
+    snapshot = rt.state.read_caps_state(day)
+    trades_remaining = max(0, rt.config.caps.daily_trade_limit - snapshot.trades_executed)
+    unrealized = unrealized_pnl(rt.client.get_positions())
+    breaker_state = "TRIPPED" if snapshot.breaker_tripped else "ARMED"
+    body = (
+        f"Trades executed: {snapshot.trades_executed} / {rt.config.caps.daily_trade_limit} "
+        f"({trades_remaining} remaining)\n"
+        f"Caps: per-trade {rt.config.caps.per_trade_pct}%, "
+        f"daily-loss {rt.config.caps.daily_loss_pct}%\n"
+        f"P&L: unrealized ${unrealized:+.2f} (live); realized not yet tracked (ADR-0005)\n"
+        f"Breaker: {breaker_state}"
+    )
+    notify(f"Daily digest ({day})", logs.redact(body))

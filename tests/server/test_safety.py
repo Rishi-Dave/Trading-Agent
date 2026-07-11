@@ -22,7 +22,7 @@ from etrade_agent.etrade.models import (
 )
 from etrade_agent.server.safety import ConfiguredSafetyGate
 from etrade_agent.store import db
-from etrade_agent.store.state import StateStore
+from etrade_agent.store.state import StateStore, today_utc
 from tests.conftest import VALID_CONFIG_TOML
 
 # VALID_CONFIG_TOML: pilot_amount_usd=1000.0, per_trade_pct=10.0 (=> $100 cap),
@@ -259,3 +259,90 @@ def test_check_preview_fails_closed_on_unexpected_exception(tmp_path: Path) -> N
 
     assert refusal is not None
     assert refusal.to_payload()["refused"] is True
+
+
+# --- breaker-tripped notification (SPEC §9, ADR-0006 Step 0 #3, choice b) ----
+# `server/` may now import `notify` (SPEC §3.1 amendment) so the gate itself
+# fires a distinct notification the instant the breaker trips, regardless of
+# caller — the runner's execute_decisions loop or a manual .mcp.json
+# place_order alike.
+
+
+def _lossy_market() -> FakeMarket:
+    # daily_loss_pct=3.0 (VALID_CONFIG_TOML) => threshold = -$30 (3% of the
+    # $1000 pilot capital). A $30 unrealized loss trips it exactly.
+    return FakeMarket(
+        positions=[Position(symbol="AAPL", quantity=10, cost_basis=1000.0, market_value=970.0)],
+        balance=_balance(),
+    )
+
+
+def test_check_place_notifies_on_a_fresh_breaker_trip(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state.set_kill_switch(engaged=False, changed_by="test-setup")
+    calls: list[tuple[str, str]] = []
+    gate = ConfiguredSafetyGate(
+        _config(tmp_path),
+        _lossy_market(),
+        state,
+        notify=lambda title, message: calls.append((title, message)),
+    )
+
+    refusal = gate.check_place(_compliant_preview(), _compliant_order())
+
+    assert refusal is not None
+    assert refusal.gate == "loss-breaker"
+    assert len(calls) == 1
+    assert "breaker" in calls[0][0].lower()
+
+
+def test_check_place_does_not_renotify_on_an_already_tripped_breaker(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state.set_kill_switch(engaged=False, changed_by="test-setup")
+    state.trip_breaker(today_utc())  # already tripped before this call runs
+    calls: list[tuple[str, str]] = []
+    gate = ConfiguredSafetyGate(
+        _config(tmp_path),
+        FakeMarket(positions=[], balance=_balance()),
+        state,
+        notify=lambda title, message: calls.append((title, message)),
+    )
+
+    refusal = gate.check_place(_compliant_preview(), _compliant_order())
+
+    assert refusal is not None
+    assert refusal.gate == "loss-breaker"
+    assert calls == []
+
+
+def test_check_place_never_fails_when_the_injected_notify_raises(tmp_path: Path) -> None:
+    """T1: a notify-channel outage must never mask the real gate result behind
+    a generic internal-error refusal — the breaker already tripped in the DB
+    by the time notify is called; the caller must still see gate=loss-breaker,
+    not a notify failure disguised as something else."""
+    state = _state(tmp_path)
+    state.set_kill_switch(engaged=False, changed_by="test-setup")
+
+    def _raising_notify(title: str, message: str) -> None:
+        raise RuntimeError("notify outage")
+
+    gate = ConfiguredSafetyGate(_config(tmp_path), _lossy_market(), state, notify=_raising_notify)
+
+    refusal = gate.check_place(_compliant_preview(), _compliant_order())
+
+    assert refusal is not None
+    assert refusal.gate == "loss-breaker"
+
+
+def test_check_place_without_an_injected_notify_still_trips_the_breaker(tmp_path: Path) -> None:
+    """The `notify` constructor param is optional (backward compatible with
+    every existing three-positional-arg construction) — it must default to a
+    safe no-op, not a required argument."""
+    state = _state(tmp_path)
+    state.set_kill_switch(engaged=False, changed_by="test-setup")
+    gate = ConfiguredSafetyGate(_config(tmp_path), _lossy_market(), state)
+
+    refusal = gate.check_place(_compliant_preview(), _compliant_order())
+
+    assert refusal is not None
+    assert refusal.gate == "loss-breaker"

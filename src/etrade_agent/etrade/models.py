@@ -46,6 +46,15 @@ class Position(BaseModel):
     market_value: float
 
 
+def unrealized_pnl(positions: list[Position]) -> float:
+    """Live unrealized P&L across positions (market_value - cost_basis,
+    summed). The single shared definition of this calculation: both the
+    loss-breaker gate (server/safety.py) and the daily digest
+    (runner/decision_run.py) read from here, never two independently
+    maintained copies that could silently drift apart (ADR-0006)."""
+    return sum(p.market_value - p.cost_basis for p in positions)
+
+
 class Balance(BaseModel):
     account_value: float
     cash_available: float

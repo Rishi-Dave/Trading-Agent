@@ -13,8 +13,15 @@ commands sent over this channel.
 from __future__ import annotations
 
 import urllib.request
+from collections.abc import Callable
+
+from etrade_agent import logs
 
 NTFY_BASE_URL = "https://ntfy.sh"
+
+_AGENT_ID = "etrade-notify"
+
+NotifyFn = Callable[[str, str], None]
 
 
 def send(topic: str, title: str, message: str, priority: str = "default") -> None:
@@ -28,3 +35,26 @@ def send(topic: str, title: str, message: str, priority: str = "default") -> Non
     )
     with urllib.request.urlopen(request, timeout=10):
         pass
+
+
+def build_notify(topic: str | None) -> NotifyFn:
+    """The production NotifyFn (SPEC §9): posts via `send` when NTFY_TOPIC is
+    configured. A missing topic or a send failure must never abort a caller —
+    by the time this is called the trade/refusal/digest already happened (or
+    didn't); a missed notification is a monitoring gap, never a reason to fail
+    (this module's own `send` docstring: callers decide whether a missed
+    notification is fatal — here, it never is). Shared by both the runner
+    (`runner/__main__.py`) and the safety gate (`server/app.py::build_runtime`,
+    ADR-0006) — living here, not in `runner/`, so `server/` can build one
+    without importing `runner/` (SPEC §3.1)."""
+
+    def _notify(title: str, message: str) -> None:
+        if not topic:
+            logs.log(_AGENT_ID, "warning", "NTFY_TOPIC not set; skipping notification", title=title)
+            return
+        try:
+            send(topic, title, message)
+        except Exception as exc:  # a notification outage must not abort the caller
+            logs.log(_AGENT_ID, "warning", "notification send failed", error=str(exc), title=title)
+
+    return _notify

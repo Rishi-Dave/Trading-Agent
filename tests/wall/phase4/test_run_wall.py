@@ -190,12 +190,20 @@ def _state(tmp_path: Path) -> StateStore:
     return StateStore(db.connect(tmp_path / "trading.db"))
 
 
-def _runtime(tmp_path: Path, *, client: FakeOrderExecutionClient | None = None) -> Runtime:
+def _runtime(
+    tmp_path: Path,
+    *,
+    client: FakeOrderExecutionClient | None = None,
+    notify: object | None = None,
+) -> Runtime:
     config = _config()
     resolved_client = client or FakeOrderExecutionClient()
     state = _state(tmp_path)
     # The REAL gate (ADR-0005) — this is the whole point of this wall.
-    gate = ConfiguredSafetyGate(config, resolved_client, state)  # type: ignore[arg-type]
+    # `notify` (ADR-0006, choice 3b) reaches the gate directly, same as
+    # build_runtime wires it — a breaker trip notifies at the source, not
+    # only when a caller happens to also pass notify into execute_decisions.
+    gate = ConfiguredSafetyGate(config, resolved_client, state, notify=notify)  # type: ignore[arg-type]
     return Runtime(
         config=config,
         client=resolved_client,  # type: ignore[arg-type]
@@ -203,6 +211,7 @@ def _runtime(tmp_path: Path, *, client: FakeOrderExecutionClient | None = None) 
         store=PreviewStore(),
         state=state,
         run_id=_RUN_ID,
+        notify=notify if notify is not None else (lambda title, message: None),  # type: ignore[arg-type]
     )
 
 
@@ -230,15 +239,17 @@ def _decision(action: Action, symbol: str = "SPY", quantity: int = 1) -> Decisio
 
 
 def test_full_pipeline_run_writes_complete_receipts_against_real_gate(tmp_path: Path) -> None:
-    rt = _runtime(tmp_path)
-    rt.state.set_kill_switch(engaged=False, changed_by="wall-setup")
     notify = _NotifyCollector()
+    rt = _runtime(tmp_path, notify=notify)
+    rt.state.set_kill_switch(engaged=False, changed_by="wall-setup")
+    status_dir = tmp_path / "status"
 
     summary = run_decision(
         rt,
         llm=FakeLLMClient(),
         news=FakeNewsSource(items=_load_news_items("SPY")),
         notify=notify,
+        status_dir=status_dir,
     )
 
     assert summary is not None
@@ -259,6 +270,24 @@ def test_full_pipeline_run_writes_complete_receipts_against_real_gate(tmp_path: 
         assert signals_json != "[]"
         assert json.loads(caps_snapshot_json)  # non-empty, parseable
     assert sum("Trade executed" in title for title, _ in notify.calls) == 2
+
+    # Phase 5 (SPEC §9): the daily digest fires at the end of the happy path.
+    assert any("digest" in title.lower() for title, _ in notify.calls)
+
+    # Phase 5 (SPEC §9): a status/<run_id>.json is written with the full
+    # receipt shape — run id, decisions, orders, refusals, duration, errors.
+    status_files = list(status_dir.glob("*.json"))
+    assert len(status_files) == 1
+    report = json.loads(status_files[0].read_text())
+    assert report["run_id"] == rt.run_id
+    assert report["stage"] == "completed"
+    assert report["decisions_considered"] == 2
+    assert report["executed_count"] == 2
+    assert report["refused_count"] == 0
+    assert len(report["orders"]) == 2
+    assert report["refusals"] == []
+    assert report["errors"] == []
+    assert report["duration_seconds"] >= 0
 
 
 # --- 2. executes <= caps: daily-trade-limit, real gate -----------------------
@@ -392,3 +421,33 @@ def test_advisory_notes_persisted_to_durable_jsonl_for_full_run(tmp_path: Path) 
     notes = notes_records[0]["data"]["notes"]
     assert "risk_advisories" in notes
     assert "risk_advisory_llm" in notes
+
+
+# --- 8. loss-breaker trip fires a distinct notification, real gate (Phase 5) -
+
+
+def test_loss_breaker_trip_fires_a_distinct_notification_against_real_gate(tmp_path: Path) -> None:
+    # daily_loss_pct=3.0 (VALID_CONFIG_TOML) => threshold = -$30 (3% of the
+    # $1000 pilot capital). A $50 markdown on a held SPY position breaches it.
+    client = FakeOrderExecutionClient(
+        positions=[Position(symbol="SPY", quantity=1, cost_basis=450.0, market_value=400.0)]
+    )
+    notify = _NotifyCollector()
+    rt = _runtime(tmp_path, client=client, notify=notify)
+    rt.state.set_kill_switch(engaged=False, changed_by="wall-setup")
+
+    summary = execute_decisions(
+        rt,
+        [
+            _decision(Action.BUY, symbol="SPY", quantity=1),
+            _decision(Action.BUY, symbol="AAPL", quantity=1),
+        ],
+        notify=notify,
+    )
+
+    assert summary.executed_count == 0
+    assert all(o.refusal_gate == "loss-breaker" for o in summary.outcomes)
+    breaker_notifications = [t for t, _ in notify.calls if "breaker" in t.lower()]
+    # At most once per day (ADR-0006, choice 3b): the second refused order
+    # hits the already-tripped branch, which never re-notifies.
+    assert len(breaker_notifications) == 1

@@ -39,6 +39,7 @@ from etrade_agent import logs
 from etrade_agent.config import AppConfig, ConfigError, load_config
 from etrade_agent.etrade import oauth
 from etrade_agent.etrade.client import SANDBOX_BASE_URL, EtradeClient
+from etrade_agent.notify.ntfy import NotifyFn, build_notify
 from etrade_agent.server.preview_store import PreviewStore
 from etrade_agent.server.safety import ConfiguredSafetyGate
 from etrade_agent.server.tools import register_tools
@@ -60,6 +61,14 @@ class ServerStartupError(Exception):
     tokens, and missing consumer credentials all raise this."""
 
 
+def _default_notify(title: str, message: str) -> None:
+    """A safe no-op default for Runtime.notify. build_runtime (the only
+    production construction path) always passes a real NotifyFn; this exists
+    so a plain `Runtime(...)` test construction that doesn't care about
+    notifications doesn't need to supply one."""
+    return None
+
+
 @dataclass(frozen=True)
 class Runtime:
     """Everything a safety-gated caller needs to reach preview_order/
@@ -74,6 +83,7 @@ class Runtime:
     store: PreviewStore
     state: StateStore
     run_id: str
+    notify: NotifyFn = _default_notify  # the SAME instance wired into `gate` (ADR-0006)
 
 
 def _best_effort_renew(tokens: oauth.OAuthTokens) -> oauth.OAuthTokens:
@@ -96,13 +106,34 @@ def _best_effort_renew(tokens: oauth.OAuthTokens) -> oauth.OAuthTokens:
         return tokens
 
 
+def make_run_id() -> str:
+    """One run_id, minted once. Callers that need it before build_runtime can
+    succeed (runner/__main__.py's startup-failure status reports, Phase 5,
+    SPEC §9) call this directly and pass the result into build_runtime's
+    `run_id=` so a failed and a successful run alike are identifiable by the
+    same id, never two divergently-minted ones."""
+    return str(uuid.uuid4())
+
+
 def build_runtime(
-    config_path: Path = DEFAULT_CONFIG_PATH, tokens_dir: Path = DEFAULT_TOKENS_DIR
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    tokens_dir: Path = DEFAULT_TOKENS_DIR,
+    *,
+    notify: NotifyFn | None = None,
+    run_id: str | None = None,
 ) -> Runtime:
     """Validate config (T5, must stay first), then construct every object a
     safety-gated caller needs. Dies (fails closed) before anything is built
     if: caps are invalid, mode isn't sandbox, consumer credentials are
-    absent, or no OAuth tokens have been recorded yet."""
+    absent, or no OAuth tokens have been recorded yet.
+
+    `notify` defaults to `build_notify(NTFY_TOPIC)` (SPEC §9) when the caller
+    doesn't inject one, and is wired into BOTH the returned Runtime and the
+    ConfiguredSafetyGate it constructs — one NotifyFn instance, never a
+    second, divergently-built one (ADR-0006, mirrors the "one gate" discipline
+    ADR-0005 established). This is what lets a loss-breaker trip notify
+    regardless of caller: the runner's execute_decisions loop, or a manual
+    .mcp.json place_order through create_app's interactive server."""
     config: AppConfig = load_config(config_path)
 
     if config.environment.mode != "sandbox":
@@ -151,11 +182,20 @@ def build_runtime(
         db_path = config_path.parent / db_path
     state = StateStore(db.connect(db_path))
 
-    gate = ConfiguredSafetyGate(config, client, state)
+    resolved_notify = notify if notify is not None else build_notify(os.environ.get("NTFY_TOPIC"))
+    gate = ConfiguredSafetyGate(config, client, state, notify=resolved_notify)
     store = PreviewStore()
-    run_id = str(uuid.uuid4())
+    resolved_run_id = run_id if run_id is not None else make_run_id()
 
-    return Runtime(config=config, client=client, gate=gate, store=store, state=state, run_id=run_id)
+    return Runtime(
+        config=config,
+        client=client,
+        gate=gate,
+        store=store,
+        state=state,
+        run_id=resolved_run_id,
+        notify=resolved_notify,
+    )
 
 
 def create_app(

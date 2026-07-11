@@ -74,12 +74,12 @@ Supporting: SQLite store (§5.1) · ntfy.sh notifications (§9) · launchd sched
 | `logs.py` | JSONL structured logging + secret redaction (T3) | — (leaf) |
 | `etrade/` | OAuth 1.0a dance/renewal, REST client, API models | `config`, `logs` |
 | `store/` | SQLite schema, migrations, state access (§5.1) | `config`, `logs` |
-| `server/` | MCP app, tool handlers, **safety layer** (§4) | `etrade`, `store`, `config`, `logs` |
+| `server/` | MCP app, tool handlers, **safety layer** (§4) | `etrade`, `store`, `config`, `logs`, `notify` |
 | `pipeline/` | Decision-pipeline protocols, news-source interface (§6) | `config`, `logs`, `etrade/models` |
 | `notify/` | ntfy.sh pings (§9) | `config`, `logs` |
 | `runner/` | Headless `claude -p` adapter, decision-run orchestration (§9, Phase 4), status reports (§9) | `config`, `logs`, `notify`, `server`, `etrade`, `store`, `pipeline` |
 
-Dependency rules: `pipeline/` never imports `server/` (the pipeline proposes; the server disposes). Nothing imports `runner/`. `etrade/` and `store/` never import `server/` or `pipeline/`. `runner/`'s wider import list (ADR-0005, Phase 4 Step 0 #2) reflects the direct-in-process runner shape: `runner/decision_run.py` calls the same `server.tools.preview_order`/`place_order` functions and the same `server.app.build_runtime()`-constructed `ConfiguredSafetyGate` the interactive MCP server uses — one enforcement setup, never two (T1) — and assembles the Phase 3 pipeline with a live `LLMClient`/`NewsSource`. This does not loosen `pipeline/`'s own restriction: pipeline steps still depend only on their injected Protocols, never on `runner/`.
+Dependency rules: `pipeline/` never imports `server/` (the pipeline proposes; the server disposes). Nothing imports `runner/`. `etrade/` and `store/` never import `server/` or `pipeline/`. `runner/`'s wider import list (ADR-0005, Phase 4 Step 0 #2) reflects the direct-in-process runner shape: `runner/decision_run.py` calls the same `server.tools.preview_order`/`place_order` functions and the same `server.app.build_runtime()`-constructed `ConfiguredSafetyGate` the interactive MCP server uses — one enforcement setup, never two (T1) — and assembles the Phase 3 pipeline with a live `LLMClient`/`NewsSource`. This does not loosen `pipeline/`'s own restriction: pipeline steps still depend only on their injected Protocols, never on `runner/`. `server/`'s import list gains `notify` in Phase 5 (ADR-0006, SPEC §9's breaker-tripped event): `ConfiguredSafetyGate` takes an injected `NotifyFn` so a loss-breaker trip notifies at the source of truth, regardless of caller — the runner's `execute_decisions` loop or a manual `.mcp.json` `place_order` alike — never a second, divergently-triggered notification path. `NotifyFn`/`build_notify` themselves live in `notify/ntfy.py`, not `runner/`, specifically so `server/` can build one without importing `runner/` (the "nothing imports `runner/`" rule is unchanged).
 
 ### §3.2 Isolation
 

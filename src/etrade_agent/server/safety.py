@@ -25,9 +25,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from etrade_agent import logs
 from etrade_agent.config import AppConfig
-from etrade_agent.etrade.models import OrderAction, OrderPreview, OrderRequest, Position
+from etrade_agent.etrade.models import (
+    OrderAction,
+    OrderPreview,
+    OrderRequest,
+    Position,
+    unrealized_pnl,
+)
+from etrade_agent.notify.ntfy import NotifyFn
 from etrade_agent.store.state import StateStore, today_utc
+
+_AGENT_ID = "etrade-server"
 
 
 @dataclass(frozen=True)
@@ -77,12 +87,25 @@ class SafetyGate(Protocol):
 class ConfiguredSafetyGate:
     """Phase 2 implementation (SPEC §7). Construction requires valid caps (T5)."""
 
-    def __init__(self, config: AppConfig, market: PositionsProvider, state: StateStore) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        market: PositionsProvider,
+        state: StateStore,
+        *,
+        notify: NotifyFn | None = None,
+    ) -> None:
         # AppConfig cannot be constructed without caps (T5); keeping the whole config
         # here means every gate reads the same validated snapshot.
         self._config = config
         self._market = market
         self._state = state
+        # SPEC §3.1 amendment (ADR-0006): server/ may import notify so a
+        # loss-breaker trip notifies at the source of truth, regardless of
+        # caller (the runner's execute_decisions loop, or a manual
+        # .mcp.json place_order). Optional/no-op by default so every existing
+        # three-positional-arg construction keeps working unchanged.
+        self._notify = notify if notify is not None else (lambda title, message: None)
 
     # -- SafetyGate protocol ---------------------------------------------
 
@@ -173,13 +196,19 @@ class ConfiguredSafetyGate:
         threshold = self._loss_threshold_usd()
         if total_pnl <= threshold:
             self._state.trip_breaker(day)
+            reason = (
+                f"daily P&L {total_pnl:.2f} breached the "
+                f"-{self._config.caps.daily_loss_pct}% threshold ({threshold:.2f}); "
+                "breaker tripped"
+            )
+            # Fresh trip only (SPEC §9, ADR-0006 Step 0 #3) — the
+            # already-tripped branch above never calls trip_breaker and never
+            # notifies, so this fires at most once per UTC day regardless of
+            # how many subsequent orders get refused.
+            self._safe_notify("Breaker tripped", reason)
             return Refusal(
                 gate="loss-breaker",
-                reason=(
-                    f"daily P&L {total_pnl:.2f} breached the "
-                    f"-{self._config.caps.daily_loss_pct}% threshold ({threshold:.2f}); "
-                    "breaker tripped"
-                ),
+                reason=reason,
                 state={
                     "date_utc": day,
                     "realized_pnl": snapshot.realized_pnl,
@@ -195,8 +224,22 @@ class ConfiguredSafetyGate:
 
     def _unrealized_pnl(self, positions: list[Position]) -> float:
         # Live positions only (ADR-0003 point 3) — positions_cache is advisory
-        # and never trusted for this safety calculation.
-        return sum(p.market_value - p.cost_basis for p in positions)
+        # and never trusted for this safety calculation. Delegates to the
+        # shared etrade.models.unrealized_pnl so the daily digest
+        # (runner/decision_run.py, ADR-0006) reads the identical calculation,
+        # never a second, potentially-drifting one.
+        return unrealized_pnl(positions)
+
+    def _safe_notify(self, title: str, message: str) -> None:
+        # T1: a notify-channel outage must never mask the real gate result —
+        # the breaker has already tripped in the DB by the time this runs, so
+        # a raising NotifyFn must not propagate up and get converted into a
+        # generic "internal-error" refusal by check_place's own try/except
+        # (that would hide gate=loss-breaker behind an unrelated failure).
+        try:
+            self._notify(title, logs.redact(message))
+        except Exception as exc:
+            logs.log(_AGENT_ID, "warning", "breaker-tripped notification failed", error=str(exc))
 
     def _check_daily_trade_limit(self) -> Refusal | None:
         day = today_utc()

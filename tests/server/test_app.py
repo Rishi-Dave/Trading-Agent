@@ -20,7 +20,13 @@ import pytest
 from etrade_agent.config import ConfigError
 from etrade_agent.etrade import oauth
 from etrade_agent.etrade.client import EtradeClient
-from etrade_agent.server.app import Runtime, ServerStartupError, build_runtime, create_app
+from etrade_agent.server.app import (
+    Runtime,
+    ServerStartupError,
+    build_runtime,
+    create_app,
+    make_run_id,
+)
 from etrade_agent.server.preview_store import PreviewStore
 from etrade_agent.server.safety import ConfiguredSafetyGate
 from etrade_agent.store.state import StateStore
@@ -290,6 +296,88 @@ def test_build_runtime_attempts_best_effort_token_renewal(
 
     assert len(calls) == 1
     assert calls[0].token == "faketoken"
+
+
+def test_build_runtime_returns_runtime_with_a_callable_notify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC §9/ADR-0006: build_runtime resolves a NotifyFn (from NTFY_TOPIC
+    when the caller doesn't inject one) and exposes it on Runtime — the same
+    seam both create_app's gate and the Phase-4 runner reach through."""
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    rt = build_runtime(path, tokens_dir)
+
+    assert callable(rt.notify)
+    rt.notify("title", "message")  # missing NTFY_TOPIC degrades to a no-op, never raises
+
+
+def test_build_runtime_passes_the_injected_notify_into_the_gate_and_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1: build_runtime is the single construction path — the NotifyFn
+    passed to ConfiguredSafetyGate must be the SAME instance exposed on
+    Runtime, never a second, divergently-built one (ADR-0006, mirrors the
+    existing "one gate" discipline ADR-0005 established for the gate itself)."""
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    captured: dict[str, object] = {}
+    real_init = ConfiguredSafetyGate.__init__
+
+    def _spy_init(self, config, market, state, *, notify=None):  # type: ignore[no-untyped-def]
+        captured["notify"] = notify
+        real_init(self, config, market, state, notify=notify)
+
+    monkeypatch.setattr(ConfiguredSafetyGate, "__init__", _spy_init)
+
+    def _notify(title: str, message: str) -> None:
+        pass
+
+    rt = build_runtime(path, tokens_dir, notify=_notify)
+
+    assert captured["notify"] is _notify
+    assert rt.notify is _notify
+
+
+def test_build_runtime_accepts_an_explicit_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """runner/__main__.py generates a run_id up front (make_run_id()) so a
+    startup-failure status report and a successful Runtime share exactly one
+    id (Phase 5, SPEC §9) — build_runtime must accept and use it rather than
+    always minting its own."""
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    rt = build_runtime(path, tokens_dir, run_id="explicit-run-id")
+
+    assert rt.run_id == "explicit-run-id"
+
+
+def test_make_run_id_returns_a_non_empty_unique_string() -> None:
+    first = make_run_id()
+    second = make_run_id()
+
+    assert isinstance(first, str) and first
+    assert first != second
 
 
 def test_build_runtime_proceeds_when_renewal_raises(
