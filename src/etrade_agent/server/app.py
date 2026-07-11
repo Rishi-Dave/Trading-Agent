@@ -11,14 +11,17 @@ Token loading fails closed (T3): a missing tokens/ directory refuses to start
 rather than falling back to any default, with an instruction to run
 `scripts/oauth_login.py`.
 
-The safety gate wired here is `PassthroughGate` (ADR-0002) — Phase 2 swaps in
-`ConfiguredSafetyGate` once the cap wall exists to force that swap.
+The safety gate wired here is `ConfiguredSafetyGate` (Phase 2, SPEC §7) — the
+cap wall (tests/wall/) forces every §4.2 gate to be real before this swap was
+made; `PassthroughGate` (ADR-0002) remains in the tree as a labeled Phase-1
+artifact but is no longer reachable from this factory.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -29,8 +32,10 @@ from etrade_agent.config import AppConfig, ConfigError, load_config
 from etrade_agent.etrade import oauth
 from etrade_agent.etrade.client import SANDBOX_BASE_URL, EtradeClient
 from etrade_agent.server.preview_store import PreviewStore
-from etrade_agent.server.safety import PassthroughGate
+from etrade_agent.server.safety import ConfiguredSafetyGate
 from etrade_agent.server.tools import register_tools
+from etrade_agent.store import db
+from etrade_agent.store.state import StateStore
 
 if TYPE_CHECKING:
     from etrade_agent.etrade.client import HttpSession
@@ -90,11 +95,20 @@ def create_app(
         # SPEC §9). The ValueError's own message is already redacted (no raw
         # account ids); re-wrapping keeps that guarantee end-to-end.
         raise ServerStartupError(str(exc)) from exc
-    gate = PassthroughGate()
+    db_path = Path(config.store.db_path)
+    if not db_path.is_absolute():
+        # Keep the DB next to the config it was loaded from — real runs land
+        # at config/trading.db (gitignored, *.db), test runs stay isolated
+        # under their own tmp_path, never the real repo's config/ directory.
+        db_path = config_path.parent / db_path
+    state = StateStore(db.connect(db_path))
+
+    gate = ConfiguredSafetyGate(config, client, state)
     store = PreviewStore()
+    run_id = str(uuid.uuid4())
 
     app = FastMCP("etrade")
-    register_tools(app, client, gate, store)
+    register_tools(app, client, gate, store, state, config, run_id)
     return app
 
 

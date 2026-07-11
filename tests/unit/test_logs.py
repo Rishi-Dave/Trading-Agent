@@ -47,6 +47,14 @@ def test_redact_handles_multiple_secrets(monkeypatch: pytest.MonkeyPatch) -> Non
     assert redact("aaa-secret and bbb-topic") == "[REDACTED] and [REDACTED]"
 
 
+def test_redact_covers_ntfy_command_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-0003 point 5: the remote-trigger TOTP shared secret is a secret
+    (T3), same tier as the ntfy topic itself — a leaked secret could
+    generate valid codes to halt or resume trading remotely."""
+    monkeypatch.setenv("NTFY_COMMAND_SECRET", "ccc-secret")
+    assert redact("secret is ccc-secret") == "secret is [REDACTED]"
+
+
 def test_file_sink_writes_redacted_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "file-sink-secret"
     monkeypatch.setenv("NTFY_TOPIC", secret)

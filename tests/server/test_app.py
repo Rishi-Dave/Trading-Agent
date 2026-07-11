@@ -173,3 +173,53 @@ def test_create_app_returns_fastmcp_app_with_six_tools(
         "place_order",
         "get_order_status",
     }
+
+
+def test_create_app_wires_configured_safety_gate_not_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The most consequential line of Phase 2 (SPEC §7, kickoff prompt):
+    PassthroughGate() -> ConfiguredSafetyGate(...). Proven behaviorally: an
+    unwhitelisted symbol must refuse via check_preview — BEFORE any live
+    E*Trade call — which PassthroughGate could never do (it always allows,
+    and the fake creds/session here would otherwise surface as a raw
+    connection error, not a clean {"refused": true} payload)."""
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    app = create_app(path, tokens_dir=tokens_dir)
+    _content, structured = asyncio.run(
+        app.call_tool(
+            "preview_order",
+            {"symbol": "TSLA", "order_action": "BUY", "quantity": 1, "order_type": "MARKET"},
+        )
+    )
+
+    assert structured == {
+        "refused": True,
+        "gate": "whitelist",
+        "reason": "TSLA is not in an enabled whitelist tier",
+        "state": {"symbol": "TSLA", "enabled_symbols": ["AAPL", "SPY"]},
+    }
+
+
+def test_create_app_opens_the_store_next_to_the_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative store.db_path resolves next to config.toml, not the process
+    CWD — keeps test runs (and real runs) from writing into unrelated
+    directories."""
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    create_app(path, tokens_dir=tokens_dir)
+
+    assert (tmp_path / "trading.db").exists()

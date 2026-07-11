@@ -18,22 +18,33 @@ machinery involved. `register_tools` is thin FastMCP wiring around them.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from etrade_agent import logs
+from etrade_agent.config import AppConfig
 from etrade_agent.etrade.client import EtradeClient
 from etrade_agent.etrade.models import (
     OrderAction,
+    OrderPreview,
     OrderRequest,
     OrderType,
     SecurityType,
 )
 from etrade_agent.server.preview_store import PreviewStore, StoredPreview
 from etrade_agent.server.safety import Refusal, SafetyGate, preview_required_refusal
+from etrade_agent.store.state import StateStore, today_utc
 
 _AGENT_ID = "etrade-server"
+
+# Phase 2 has no decision pipeline yet (Phase 3 spike, SPEC §6) — trade_log
+# receipts (T4) still need a non-empty reasoning_summary/signals_json. This is
+# an explicit placeholder, not a silently missing value.
+_NO_PIPELINE_REASONING = (
+    "no decision pipeline yet (Phase 3) — order placed via direct MCP tool call"
+)
 
 
 def _log_refusal(refusal: Refusal) -> None:
@@ -58,27 +69,109 @@ def get_order_status(client: EtradeClient, etrade_order_id: str) -> dict[str, An
 
 
 def preview_order(
-    client: EtradeClient, gate: SafetyGate, store: PreviewStore, order: OrderRequest
+    client: EtradeClient,
+    gate: SafetyGate,
+    store: PreviewStore,
+    state: StateStore,
+    config: AppConfig,
+    run_id: str,
+    order: OrderRequest,
 ) -> dict[str, Any]:
-    """T1: the gate runs before any E*Trade call. On success, the binding is
-    stored so a later place_order in this same run can reference it (T2)."""
+    """T1: the gate runs before any E*Trade call. `check_priced_preview` runs
+    once pricing exists (capital-ceiling/per-trade-cap need estimated_cost,
+    ADR-0003 point 7) and before the binding is stored, so an oversized order
+    can never become placeable. On success, the binding is stored so a later
+    place_order in this same run can reference it (T2). T4/SPEC §5.1: a
+    refusal on a fully-specified order still gets a trade_log row — the
+    JSONL refusal log (§4.1) isn't a substitute for the durable receipt."""
     refusal = gate.check_preview(order)
     if refusal is not None:
         _log_refusal(refusal)
+        _write_refusal_receipt(state, config, run_id, order, preview=None, refusal=refusal)
         return refusal.to_payload()
 
     preview, binding = client.preview_order(order)
+
+    priced_refusal = gate.check_priced_preview(preview, order)
+    if priced_refusal is not None:
+        _log_refusal(priced_refusal)
+        _write_refusal_receipt(
+            state, config, run_id, order, preview=preview, refusal=priced_refusal
+        )
+        return priced_refusal.to_payload()
+
     store.put(StoredPreview(order=order, preview=preview, binding=binding))
     return preview.model_dump(mode="json")
 
 
+def _write_refusal_receipt(
+    state: StateStore,
+    config: AppConfig,
+    run_id: str,
+    order: OrderRequest,
+    preview: OrderPreview | None,
+    refusal: Refusal,
+) -> None:
+    """T4/SPEC §5.1: trade_log is "one row per attempted order" — covers
+    every refusal that has a real OrderRequest to attach (check_preview,
+    check_priced_preview, check_place). The T2 preview-required refusal
+    (server/tools.py::place_order, unknown preview_id) has no OrderRequest —
+    store.get() found nothing — so there is no order data to write; it stays
+    JSONL-only."""
+    state.write_trade_log(
+        run_id=run_id,
+        config_version=config.config_version,
+        symbol=order.symbol,
+        order_action=order.order_action.value,
+        security_type=order.security_type.value,
+        quantity=order.quantity,
+        preview_id=preview.preview_id if preview is not None else None,
+        estimated_cost=preview.estimated_cost if preview is not None else None,
+        executed=False,
+        refusal_gate=refusal.gate,
+        etrade_order_id=None,
+        reasoning_summary=_NO_PIPELINE_REASONING,
+        signals_json="[]",
+        caps_snapshot_json=_caps_snapshot_json(config, state),
+    )
+
+
+def _caps_snapshot_json(config: AppConfig, state: StateStore) -> str:
+    """T4: a snapshot of caps state at decision time, alongside the configured
+    thresholds it was measured against — enough to reconstruct "why" without
+    a second query."""
+    day = today_utc()
+    snapshot = state.read_caps_state(day)
+    return json.dumps(
+        {
+            "date_utc": day,
+            "trades_executed": snapshot.trades_executed,
+            "realized_pnl": snapshot.realized_pnl,
+            "breaker_tripped": snapshot.breaker_tripped,
+            "per_trade_pct": config.caps.per_trade_pct,
+            "daily_trade_limit": config.caps.daily_trade_limit,
+            "daily_loss_pct": config.caps.daily_loss_pct,
+            "pilot_amount_usd": config.capital.pilot_amount_usd,
+        }
+    )
+
+
 def place_order(
-    client: EtradeClient, gate: SafetyGate, store: PreviewStore, preview_id: str
+    client: EtradeClient,
+    gate: SafetyGate,
+    store: PreviewStore,
+    state: StateStore,
+    config: AppConfig,
+    run_id: str,
+    preview_id: str,
 ) -> dict[str, Any]:
     """T2: place_order accepts only a preview_id bound to a preview issued in
     this run — the PreviewStore lookup IS that enforcement (an unknown id can
     never reach the E*Trade order endpoint). T1: check_place runs before the
-    client call. One-shot: consumed only after a successful place."""
+    client call. One-shot: consumed only after a successful place. T4: a
+    successful place writes a trade_log receipt (reasoning_summary/
+    signals_json/caps_snapshot_json) — Phase 2 has no decision pipeline yet
+    (Phase 3), so the reasoning fields are placeholders, never blank."""
     entry = store.get(preview_id)
     if entry is None:
         missing_refusal = preview_required_refusal(preview_id)
@@ -88,15 +181,70 @@ def place_order(
     refusal = gate.check_place(entry.preview, entry.order)
     if refusal is not None:
         _log_refusal(refusal)
+        _write_refusal_receipt(
+            state, config, run_id, entry.order, preview=entry.preview, refusal=refusal
+        )
         return refusal.to_payload()
+
+    # Caps snapshot BEFORE this trade counts itself — "state at decision time."
+    caps_snapshot_json = _caps_snapshot_json(config, state)
 
     status = client.place_from_binding(entry.binding)
     store.consume(preview_id)
+
+    # The order has ALREADY executed at this point (irreversible, T2) — a
+    # state-write failure here (e.g. concurrent access to trading.db from the
+    # local CLIs/remote listener, ADR-0003 Consequences) must never be
+    # silently swallowed, and must never make the caller think the order
+    # itself failed (a retry on a false failure could double-place). Fail
+    # LOUD instead: log at error level with everything needed to manually
+    # backfill the trade_log row, and still return the real success.
+    try:
+        state.record_executed_trade(
+            date_utc=today_utc(),
+            run_id=run_id,
+            config_version=config.config_version,
+            symbol=entry.order.symbol,
+            order_action=entry.order.order_action.value,
+            security_type=entry.order.security_type.value,
+            quantity=entry.order.quantity,
+            preview_id=entry.preview.preview_id,
+            estimated_cost=entry.preview.estimated_cost,
+            executed=True,
+            refusal_gate=None,
+            etrade_order_id=status.etrade_order_id,
+            reasoning_summary=_NO_PIPELINE_REASONING,
+            signals_json="[]",
+            caps_snapshot_json=caps_snapshot_json,
+        )
+    except Exception as exc:
+        logs.log(
+            _AGENT_ID,
+            "error",
+            "EXECUTED TRADE FAILED TO WRITE trade_log / increment daily count "
+            "— manual backfill required (T4)",
+            run_id=run_id,
+            symbol=entry.order.symbol,
+            order_action=entry.order.order_action.value,
+            security_type=entry.order.security_type.value,
+            quantity=entry.order.quantity,
+            preview_id=entry.preview.preview_id,
+            estimated_cost=entry.preview.estimated_cost,
+            etrade_order_id=status.etrade_order_id,
+            error=str(exc),
+        )
+
     return status.model_dump(mode="json")
 
 
 def register_tools(
-    app: FastMCP, client: EtradeClient, gate: SafetyGate, store: PreviewStore
+    app: FastMCP,
+    client: EtradeClient,
+    gate: SafetyGate,
+    store: PreviewStore,
+    state: StateStore,
+    config: AppConfig,
+    run_id: str,
 ) -> None:
     """Register the six SPEC §5.2 tools on the FastMCP app."""
 
@@ -140,10 +288,10 @@ def register_tools(
             order_type=OrderType(order_type),
             limit_price=limit_price,
         )
-        return preview_order(client, gate, store, order)
+        return preview_order(client, gate, store, state, config, run_id, order)
 
     @app.tool(name="place_order")
     def _place_order(preview_id: str) -> dict[str, Any]:
         """Place an order previously previewed in this run (T2). Refusal shape
         (SPEC §4.1): {"refused": true, "gate", "reason", "state"}."""
-        return place_order(client, gate, store, preview_id)
+        return place_order(client, gate, store, state, config, run_id, preview_id)

@@ -1,7 +1,13 @@
 """ntfy.sh notifications (SPEC §9) — one stdlib HTTP POST, no dependencies.
 
-The topic comes from NTFY_TOPIC in .env and is treated as a secret (T3): topics
-are a public namespace, so it must be a long random string and never logged.
+The topic comes from NTFY_TOPIC in .env: a long random string, never logged
+(T3 redaction, logs.py), kept out of code/fixtures — basic hygiene against
+casual discovery. It is NOT, on its own, an authorization boundary: ntfy
+topics are a public pub/sub namespace with no per-subscriber confidentiality,
+so anyone who does discover the topic can read everything published to it.
+scripts/remote_listener.py (ADR-0003 point 5) relies on a separate TOTP
+rotating code, not topic secrecy, to authorize kill-switch/breaker-reset
+commands sent over this channel.
 """
 
 from __future__ import annotations
