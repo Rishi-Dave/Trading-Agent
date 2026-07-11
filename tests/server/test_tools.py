@@ -276,6 +276,83 @@ def test_preview_order_success_stores_binding_for_later_place(tmp_path: Path) ->
     assert stored.binding == binding
 
 
+# --- ADR-0004: reasoning_summary/signals_json passthrough (T4 receipt seam) --
+
+
+def test_preview_order_default_reasoning_is_the_honest_placeholder(tmp_path: Path) -> None:
+    """A caller with no pipeline behind it (direct/manual MCP call) gets the
+    honest default, not a fabricated claim that a pipeline ran."""
+    preview, binding = _preview_and_binding("pv-default")
+    client = SpyClient(calls=[], preview_result=(preview, binding))
+    gate = SpyGate()
+    store = PreviewStore()
+
+    tools.preview_order(client, gate, store, _state(tmp_path), _config(tmp_path), _RUN_ID, _order())
+
+    stored = store.get("pv-default")
+    assert stored is not None
+    assert stored.reasoning_summary == tools._NO_PIPELINE_REASONING
+    assert stored.signals_json == "[]"
+
+
+def test_preview_order_stores_supplied_reasoning_and_signals(tmp_path: Path) -> None:
+    """ADR-0004: a Decision's real reasoning, when a pipeline supplied one,
+    is bound to the StoredPreview so place_order inherits it (T2-aligned:
+    no new place-time parameter)."""
+    preview, binding = _preview_and_binding("pv-real")
+    client = SpyClient(calls=[], preview_result=(preview, binding))
+    gate = SpyGate()
+    store = PreviewStore()
+    real_signals_json = (
+        '[{"source": "trader", "as_of": "2026-07-11T00:00:00+00:00", "summary": "x", "detail": {}}]'
+    )
+
+    tools.preview_order(
+        client,
+        gate,
+        store,
+        _state(tmp_path),
+        _config(tmp_path),
+        _RUN_ID,
+        _order(),
+        reasoning_summary="real decision reasoning",
+        signals_json=real_signals_json,
+    )
+
+    stored = store.get("pv-real")
+    assert stored is not None
+    assert stored.reasoning_summary == "real decision reasoning"
+    assert stored.signals_json == real_signals_json
+
+
+def test_preview_order_refusal_writes_supplied_reasoning_not_the_placeholder(
+    tmp_path: Path,
+) -> None:
+    client = SpyClient(calls=[])
+    refusal = Refusal(gate="whitelist", reason="not whitelisted", state={"symbol": "SPY"})
+    gate = SpyGate(preview_refusal=refusal)
+    store = PreviewStore()
+    state = _state(tmp_path)
+
+    tools.preview_order(
+        client,
+        gate,
+        store,
+        state,
+        _config(tmp_path),
+        _RUN_ID,
+        _order(),
+        reasoning_summary="real decision reasoning",
+        signals_json='[{"source": "trader"}]',
+    )
+
+    row = state.conn.execute("SELECT reasoning_summary, signals_json FROM trade_log").fetchone()
+    assert row is not None
+    assert row[0] == "real decision reasoning"
+    assert row[0] != tools._NO_PIPELINE_REASONING
+    assert row[1] == '[{"source": "trader"}]'
+
+
 # --- place_order: T2 (preview must exist), T1 (gate before client) ---
 
 _RUN_ID = "test-run-1"
@@ -430,6 +507,69 @@ def test_place_order_success_writes_t4_trade_log_receipt(tmp_path: Path) -> None
     assert reasoning_summary  # non-empty placeholder (T4: never blank)
     assert signals_json == "[]"
     assert caps_snapshot_json  # non-empty JSON snapshot
+
+
+def test_place_order_success_writes_reasoning_inherited_from_stored_preview(
+    tmp_path: Path,
+) -> None:
+    """ADR-0004: place_order has no reasoning parameter of its own — it
+    inherits the StoredPreview's reasoning_summary/signals_json, bound at
+    preview_order time. This proves the real seam, not just the placeholder
+    default (already covered by test_place_order_success_writes_t4_trade_log_receipt)."""
+    preview, binding = _preview_and_binding("pv1")
+    client = SpyClient(
+        calls=[],
+        place_result=OrderStatus(etrade_order_id="999", status="OPEN", filled_quantity=0),
+    )
+    gate = SpyGate()
+    store = PreviewStore()
+    real_signals_json = (
+        '[{"source": "trader", "as_of": "2026-07-11T00:00:00+00:00", "summary": "x", "detail": {}}]'
+    )
+    store.put(
+        StoredPreview(
+            order=_order(),
+            preview=preview,
+            binding=binding,
+            reasoning_summary="real decision reasoning",
+            signals_json=real_signals_json,
+        )
+    )
+    state = _state(tmp_path)
+
+    tools.place_order(client, gate, store, state, _config(tmp_path), _RUN_ID, "pv1")
+
+    row = state.conn.execute("SELECT reasoning_summary, signals_json FROM trade_log").fetchone()
+    assert row is not None
+    assert row[0] == "real decision reasoning"
+    assert row[0] != tools._NO_PIPELINE_REASONING
+    assert row[1] == real_signals_json
+
+
+def test_place_order_refusal_writes_reasoning_inherited_from_stored_preview(
+    tmp_path: Path,
+) -> None:
+    preview, binding = _preview_and_binding("pv1")
+    client = SpyClient(calls=[])
+    gate = SpyGate(place_refusal=Refusal(gate="kill-switch", reason="engaged", state={}))
+    store = PreviewStore()
+    store.put(
+        StoredPreview(
+            order=_order(),
+            preview=preview,
+            binding=binding,
+            reasoning_summary="real decision reasoning",
+            signals_json='[{"source": "trader"}]',
+        )
+    )
+    state = _state(tmp_path)
+
+    tools.place_order(client, gate, store, state, _config(tmp_path), _RUN_ID, "pv1")
+
+    row = state.conn.execute("SELECT reasoning_summary, signals_json FROM trade_log").fetchone()
+    assert row is not None
+    assert row[0] == "real decision reasoning"
+    assert row[1] == '[{"source": "trader"}]'
 
 
 def test_place_order_success_logs_loudly_if_receipt_write_fails(

@@ -33,18 +33,15 @@ from etrade_agent.etrade.models import (
     OrderType,
     SecurityType,
 )
-from etrade_agent.server.preview_store import PreviewStore, StoredPreview
+from etrade_agent.server.preview_store import (
+    _NO_PIPELINE_REASONING,
+    PreviewStore,
+    StoredPreview,
+)
 from etrade_agent.server.safety import Refusal, SafetyGate, preview_required_refusal
 from etrade_agent.store.state import StateStore, today_utc
 
 _AGENT_ID = "etrade-server"
-
-# Phase 2 has no decision pipeline yet (Phase 3 spike, SPEC §6) — trade_log
-# receipts (T4) still need a non-empty reasoning_summary/signals_json. This is
-# an explicit placeholder, not a silently missing value.
-_NO_PIPELINE_REASONING = (
-    "no decision pipeline yet (Phase 3) — order placed via direct MCP tool call"
-)
 
 
 def _log_refusal(refusal: Refusal) -> None:
@@ -76,6 +73,8 @@ def preview_order(
     config: AppConfig,
     run_id: str,
     order: OrderRequest,
+    reasoning_summary: str = _NO_PIPELINE_REASONING,
+    signals_json: str = "[]",
 ) -> dict[str, Any]:
     """T1: the gate runs before any E*Trade call. `check_priced_preview` runs
     once pricing exists (capital-ceiling/per-trade-cap need estimated_cost,
@@ -83,11 +82,24 @@ def preview_order(
     can never become placeable. On success, the binding is stored so a later
     place_order in this same run can reference it (T2). T4/SPEC §5.1: a
     refusal on a fully-specified order still gets a trade_log row — the
-    JSONL refusal log (§4.1) isn't a substitute for the durable receipt."""
+    JSONL refusal log (§4.1) isn't a substitute for the durable receipt.
+    `reasoning_summary`/`signals_json` (ADR-0004) are the Decision's real
+    T4 receipts when a pipeline called this; callers with no pipeline behind
+    them (a direct/manual MCP call) get the honest default instead of a
+    fabricated one."""
     refusal = gate.check_preview(order)
     if refusal is not None:
         _log_refusal(refusal)
-        _write_refusal_receipt(state, config, run_id, order, preview=None, refusal=refusal)
+        _write_refusal_receipt(
+            state,
+            config,
+            run_id,
+            order,
+            preview=None,
+            refusal=refusal,
+            reasoning_summary=reasoning_summary,
+            signals_json=signals_json,
+        )
         return refusal.to_payload()
 
     preview, binding = client.preview_order(order)
@@ -96,11 +108,26 @@ def preview_order(
     if priced_refusal is not None:
         _log_refusal(priced_refusal)
         _write_refusal_receipt(
-            state, config, run_id, order, preview=preview, refusal=priced_refusal
+            state,
+            config,
+            run_id,
+            order,
+            preview=preview,
+            refusal=priced_refusal,
+            reasoning_summary=reasoning_summary,
+            signals_json=signals_json,
         )
         return priced_refusal.to_payload()
 
-    store.put(StoredPreview(order=order, preview=preview, binding=binding))
+    store.put(
+        StoredPreview(
+            order=order,
+            preview=preview,
+            binding=binding,
+            reasoning_summary=reasoning_summary,
+            signals_json=signals_json,
+        )
+    )
     return preview.model_dump(mode="json")
 
 
@@ -111,6 +138,9 @@ def _write_refusal_receipt(
     order: OrderRequest,
     preview: OrderPreview | None,
     refusal: Refusal,
+    *,
+    reasoning_summary: str = _NO_PIPELINE_REASONING,
+    signals_json: str = "[]",
 ) -> None:
     """T4/SPEC §5.1: trade_log is "one row per attempted order" — covers
     every refusal that has a real OrderRequest to attach (check_preview,
@@ -130,8 +160,8 @@ def _write_refusal_receipt(
         executed=False,
         refusal_gate=refusal.gate,
         etrade_order_id=None,
-        reasoning_summary=_NO_PIPELINE_REASONING,
-        signals_json="[]",
+        reasoning_summary=reasoning_summary,
+        signals_json=signals_json,
         caps_snapshot_json=_caps_snapshot_json(config, state),
     )
 
@@ -170,8 +200,9 @@ def place_order(
     never reach the E*Trade order endpoint). T1: check_place runs before the
     client call. One-shot: consumed only after a successful place. T4: a
     successful place writes a trade_log receipt (reasoning_summary/
-    signals_json/caps_snapshot_json) — Phase 2 has no decision pipeline yet
-    (Phase 3), so the reasoning fields are placeholders, never blank."""
+    signals_json/caps_snapshot_json), inherited from the StoredPreview bound
+    at preview_order time (ADR-0004) — the real Decision's reasoning when a
+    pipeline supplied one, the honest default otherwise. Never blank."""
     entry = store.get(preview_id)
     if entry is None:
         missing_refusal = preview_required_refusal(preview_id)
@@ -182,7 +213,14 @@ def place_order(
     if refusal is not None:
         _log_refusal(refusal)
         _write_refusal_receipt(
-            state, config, run_id, entry.order, preview=entry.preview, refusal=refusal
+            state,
+            config,
+            run_id,
+            entry.order,
+            preview=entry.preview,
+            refusal=refusal,
+            reasoning_summary=entry.reasoning_summary,
+            signals_json=entry.signals_json,
         )
         return refusal.to_payload()
 
@@ -213,8 +251,8 @@ def place_order(
             executed=True,
             refusal_gate=None,
             etrade_order_id=status.etrade_order_id,
-            reasoning_summary=_NO_PIPELINE_REASONING,
-            signals_json="[]",
+            reasoning_summary=entry.reasoning_summary,
+            signals_json=entry.signals_json,
             caps_snapshot_json=caps_snapshot_json,
         )
     except Exception as exc:
@@ -276,10 +314,14 @@ def register_tools(
         order_type: str,
         security_type: str = "EQ",
         limit_price: float | None = None,
+        reasoning_summary: str = _NO_PIPELINE_REASONING,
+        signals_json: str = "[]",
     ) -> dict[str, Any]:
         """Preview an order (T2: place_order requires this preview's id).
         Refusal shape (SPEC §4.1): {"refused": true, "gate", "reason", "state"}.
-        """
+        `reasoning_summary`/`signals_json` (ADR-0004): a decision pipeline's
+        real T4 receipts for this order, if it has one — left at the honest
+        default for a direct/manual call."""
         order = OrderRequest(
             symbol=symbol,
             order_action=OrderAction(order_action),
@@ -288,7 +330,17 @@ def register_tools(
             order_type=OrderType(order_type),
             limit_price=limit_price,
         )
-        return preview_order(client, gate, store, state, config, run_id, order)
+        return preview_order(
+            client,
+            gate,
+            store,
+            state,
+            config,
+            run_id,
+            order,
+            reasoning_summary=reasoning_summary,
+            signals_json=signals_json,
+        )
 
     @app.tool(name="place_order")
     def _place_order(preview_id: str) -> dict[str, Any]:

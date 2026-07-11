@@ -35,11 +35,17 @@ def claude_query(
     system_prompt: str | None = None,
     max_turns: int = 1,
     timeout: int = 300,
+    allowed_tools: list[str] | None = None,
 ) -> str:
-    """Single-shot query. Returns stdout; raises RuntimeError on nonzero exit."""
+    """Single-shot query. Returns stdout; raises RuntimeError on nonzero exit.
+    `allowed_tools` (e.g. `["WebSearch"]`, ADR-0004) is the seam
+    `pipeline/llm.py::LLMClient`'s WebSearch-backed steps rely on — with no
+    allowlist the session has no tool access at all."""
     cmd = ["claude", "--print", "--max-turns", str(max_turns)]
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
+    if allowed_tools:
+        cmd += ["--allowedTools", ",".join(allowed_tools)]
     result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"claude exited {result.returncode}: {result.stderr.strip()}")
