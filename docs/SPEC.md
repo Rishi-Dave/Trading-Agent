@@ -77,9 +77,9 @@ Supporting: SQLite store (§5.1) · ntfy.sh notifications (§9) · launchd sched
 | `server/` | MCP app, tool handlers, **safety layer** (§4) | `etrade`, `store`, `config`, `logs` |
 | `pipeline/` | Decision-pipeline protocols, news-source interface (§6) | `config`, `logs`, `etrade/models` |
 | `notify/` | ntfy.sh pings (§9) | `config`, `logs` |
-| `runner/` | Headless `claude -p` adapter, status reports (§9) | `config`, `logs`, `notify` |
+| `runner/` | Headless `claude -p` adapter, decision-run orchestration (§9, Phase 4), status reports (§9) | `config`, `logs`, `notify`, `server`, `etrade`, `store`, `pipeline` |
 
-Dependency rules: `pipeline/` never imports `server/` (the pipeline proposes; the server disposes). Nothing imports `runner/`. `etrade/` and `store/` never import `server/` or `pipeline/`.
+Dependency rules: `pipeline/` never imports `server/` (the pipeline proposes; the server disposes). Nothing imports `runner/`. `etrade/` and `store/` never import `server/` or `pipeline/`. `runner/`'s wider import list (ADR-0005, Phase 4 Step 0 #2) reflects the direct-in-process runner shape: `runner/decision_run.py` calls the same `server.tools.preview_order`/`place_order` functions and the same `server.app.build_runtime()`-constructed `ConfiguredSafetyGate` the interactive MCP server uses — one enforcement setup, never two (T1) — and assembles the Phase 3 pipeline with a live `LLMClient`/`NewsSource`. This does not loosen `pipeline/`'s own restriction: pipeline steps still depend only on their injected Protocols, never on `runner/`.
 
 ### §3.2 Isolation
 
@@ -250,6 +250,6 @@ Tracked honestly; nothing below silently defers.
 
 - [ ] **Exact cap numbers + pilot capital** — required before the server will start (T5); decide when funding the account.
 - [ ] **Pipeline shape** — TradingAgents vs AI Hedge Fund; Phase 3 spike + ADR (§6).
-- [ ] **OAuth token renewal approach** — interactive daily renew vs automated renew flow given the 2 hr idle / nightly expiry; Phase 1 Step-0 design question.
+- [x] **OAuth token renewal approach** — resolved Phase 4 (ADR-0005 point 2): the nightly hard expiry structurally requires a human (`scripts/oauth_login.py`, ~30s daily) since E*Trade's oob dance needs a browser-verifier step; the 2 hr idle timeout is now recovered automatically (`renew_tokens()`, wired into `server/app.py::build_runtime`, best-effort/non-fatal). No further automation is possible without storing E*Trade web-login credentials, which was rejected (ADR-0002 point 1, reaffirmed ADR-0005).
 - [ ] **E*Trade sandbox key** — user action: request developer credentials; approval can take days–weeks. Phase 1 blocks on this.
 - [ ] **Prod cutover checklist details** — drafted in Phase 6 planning; sandbox-prod skill holds the interim rules.

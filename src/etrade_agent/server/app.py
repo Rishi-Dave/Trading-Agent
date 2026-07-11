@@ -2,10 +2,10 @@
 
 Startup enforces gate `caps-required` (SPEC §4.2, T5): the server exits nonzero
 before registering any tool if config is missing or caps are invalid — `load_config`
-is deliberately the FIRST statement in `create_app`, before dotenv/token loading,
+is deliberately the FIRST statement in `build_runtime`, before dotenv/token loading,
 so a bad config never reaches those paths (caps wall: test_server_factory_dies_without_caps).
 
-Phase 1 is sandbox-only end to end (sandbox-prod skill): `create_app` refuses any
+Phase 1 is sandbox-only end to end (sandbox-prod skill): startup refuses any
 `environment.mode != "sandbox"` outright — there is no prod code path this phase.
 Token loading fails closed (T3): a missing tokens/ directory refuses to start
 rather than falling back to any default, with an instruction to run
@@ -15,6 +15,12 @@ The safety gate wired here is `ConfiguredSafetyGate` (Phase 2, SPEC §7) — the
 cap wall (tests/wall/) forces every §4.2 gate to be real before this swap was
 made; `PassthroughGate` (ADR-0002) remains in the tree as a labeled Phase-1
 artifact but is no longer reachable from this factory.
+
+`build_runtime` (Phase 4, ADR-0005/SPEC §3.1 Step 0 #2) is the single object-
+construction path both this MCP server (`create_app`) and the Phase-4 runner
+(`runner/decision_run.py`) use to reach the safety-gated tool functions — one
+enforcement setup, never two divergently-built copies (T1). `create_app` is a
+thin FastMCP wrapper around it.
 """
 
 from __future__ import annotations
@@ -22,12 +28,14 @@ from __future__ import annotations
 import os
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from etrade_agent import logs
 from etrade_agent.config import AppConfig, ConfigError, load_config
 from etrade_agent.etrade import oauth
 from etrade_agent.etrade.client import SANDBOX_BASE_URL, EtradeClient
@@ -43,6 +51,8 @@ if TYPE_CHECKING:
 DEFAULT_CONFIG_PATH = Path("config/config.toml")
 DEFAULT_TOKENS_DIR = Path("tokens")
 
+_AGENT_ID = "etrade-server"
+
 
 class ServerStartupError(Exception):
     """Startup refused for a reason other than caps (T5's ConfigError covers
@@ -50,13 +60,49 @@ class ServerStartupError(Exception):
     tokens, and missing consumer credentials all raise this."""
 
 
-def create_app(
+@dataclass(frozen=True)
+class Runtime:
+    """Everything a safety-gated caller needs to reach preview_order/
+    place_order (SPEC §3.1 Step 0 #2, ADR-0005): built once, by build_runtime,
+    so the interactive MCP server and the Phase-4 runner enforce through the
+    identical ConfiguredSafetyGate/EtradeClient/StateStore — never a second,
+    divergently-constructed copy (T1)."""
+
+    config: AppConfig
+    client: EtradeClient
+    gate: ConfiguredSafetyGate
+    store: PreviewStore
+    state: StateStore
+    run_id: str
+
+
+def _best_effort_renew(tokens: oauth.OAuthTokens) -> oauth.OAuthTokens:
+    """Idle-timeout recovery only (ADR-0005, SPEC §10; renew_tokens() itself
+    is Phase 1 / ADR-0002 point 1). renew_tokens() cannot survive the
+    midnight-ET hard expiry, so a failure here is the EXPECTED case on a
+    fresh morning, not a startup failure — it's caught and logged, and the
+    caller proceeds with the original tokens. The downstream
+    EtradeClient.connect()/signed_session use is the real liveness check
+    that fails closed on a token that is genuinely dead."""
+    try:
+        return oauth.renew_tokens(tokens)
+    except Exception as exc:  # best-effort: a failure here just means "keep the existing tokens"
+        logs.log(
+            _AGENT_ID,
+            "warning",
+            "token renewal failed (idle-timeout recovery attempt); proceeding with existing tokens",
+            error=str(exc),
+        )
+        return tokens
+
+
+def build_runtime(
     config_path: Path = DEFAULT_CONFIG_PATH, tokens_dir: Path = DEFAULT_TOKENS_DIR
-) -> FastMCP:
-    """Validate config (T5, must stay first), then build the FastMCP app with
-    the six SPEC §5.2 tools registered. Dies (fails closed) before any tool is
-    registered if: caps are invalid, mode isn't sandbox, consumer credentials
-    are absent, or no OAuth tokens have been recorded yet."""
+) -> Runtime:
+    """Validate config (T5, must stay first), then construct every object a
+    safety-gated caller needs. Dies (fails closed) before anything is built
+    if: caps are invalid, mode isn't sandbox, consumer credentials are
+    absent, or no OAuth tokens have been recorded yet."""
     config: AppConfig = load_config(config_path)
 
     if config.environment.mode != "sandbox":
@@ -75,6 +121,8 @@ def create_app(
         raise ServerStartupError(
             f"no tokens in {tokens_dir}/ — run: uv run python scripts/oauth_login.py"
         )
+
+    tokens = _best_effort_renew(tokens)
 
     session = oauth.signed_session(consumer_key, consumer_secret, tokens)
     # OAuth1Session structurally satisfies HttpSession at runtime (we only ever
@@ -107,8 +155,17 @@ def create_app(
     store = PreviewStore()
     run_id = str(uuid.uuid4())
 
+    return Runtime(config=config, client=client, gate=gate, store=store, state=state, run_id=run_id)
+
+
+def create_app(
+    config_path: Path = DEFAULT_CONFIG_PATH, tokens_dir: Path = DEFAULT_TOKENS_DIR
+) -> FastMCP:
+    """Build the FastMCP app with the six SPEC §5.2 tools registered, via
+    build_runtime — the shared runtime-construction path (ADR-0005)."""
+    rt = build_runtime(config_path, tokens_dir)
     app = FastMCP("etrade")
-    register_tools(app, client, gate, store, state, config, run_id)
+    register_tools(app, rt.client, rt.gate, rt.store, rt.state, rt.config, rt.run_id)
     return app
 
 

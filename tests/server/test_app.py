@@ -19,7 +19,11 @@ import pytest
 
 from etrade_agent.config import ConfigError
 from etrade_agent.etrade import oauth
-from etrade_agent.server.app import ServerStartupError, create_app
+from etrade_agent.etrade.client import EtradeClient
+from etrade_agent.server.app import Runtime, ServerStartupError, build_runtime, create_app
+from etrade_agent.server.preview_store import PreviewStore
+from etrade_agent.server.safety import ConfiguredSafetyGate
+from etrade_agent.store.state import StateStore
 from tests.conftest import VALID_CONFIG_TOML
 
 
@@ -155,6 +159,11 @@ def test_create_app_fails_closed_on_ambiguous_account_without_leaking_ids(
 def test_create_app_returns_fastmcp_app_with_six_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # build_runtime (Phase 4/ADR-0005) now attempts a best-effort token
+    # renewal on every call; neutralize it here so this stays a live-network-free
+    # test (module docstring's "Hermetic" claim) rather than a real HTTPS call
+    # to api.etrade.com with garbage fake credentials.
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
     monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
     monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
     monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
@@ -184,6 +193,8 @@ def test_create_app_wires_configured_safety_gate_not_passthrough(
     E*Trade call — which PassthroughGate could never do (it always allows,
     and the fake creds/session here would otherwise surface as a raw
     connection error, not a clean {"refused": true} payload)."""
+    # Same hermeticity note as test_create_app_returns_fastmcp_app_with_six_tools.
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
     monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
     monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
     monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
@@ -213,6 +224,8 @@ def test_create_app_opens_the_store_next_to_the_config(
     """A relative store.db_path resolves next to config.toml, not the process
     CWD — keeps test runs (and real runs) from writing into unrelated
     directories."""
+    # Same hermeticity note as test_create_app_returns_fastmcp_app_with_six_tools.
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
     monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
     monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
     monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
@@ -223,3 +236,83 @@ def test_create_app_opens_the_store_next_to_the_config(
     create_app(path, tokens_dir=tokens_dir)
 
     assert (tmp_path / "trading.db").exists()
+
+
+def test_build_runtime_returns_runtime_with_all_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC §3.1 Step 0 #2 / ADR-0005: build_runtime is the single construction
+    path both create_app and the Phase-4 runner use to reach the safety-gated
+    tool functions — proven by checking every component create_app wires into
+    register_tools is present on the returned Runtime (T1: one enforcement
+    setup, never two divergent ones)."""
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", lambda tokens: tokens)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    rt = build_runtime(path, tokens_dir)
+
+    assert isinstance(rt, Runtime)
+    assert rt.config.config_version == 1
+    assert isinstance(rt.client, EtradeClient)
+    assert isinstance(rt.gate, ConfiguredSafetyGate)
+    assert isinstance(rt.store, PreviewStore)
+    assert isinstance(rt.state, StateStore)
+    assert isinstance(rt.run_id, str) and rt.run_id
+
+
+def test_build_runtime_attempts_best_effort_token_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC §10/ADR-0005: renew_tokens() was built in Phase 1 (ADR-0002) but
+    had zero callers until now. build_runtime wires it as best-effort
+    idle-timeout recovery so an unattended Phase-4 run doesn't need a human
+    every time the token has merely gone idle (2 hr) within the same day."""
+    calls: list[oauth.OAuthTokens] = []
+
+    def _spy_renew(tokens: oauth.OAuthTokens) -> oauth.OAuthTokens:
+        calls.append(tokens)
+        return tokens
+
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", _spy_renew)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    build_runtime(path, tokens_dir)
+
+    assert len(calls) == 1
+    assert calls[0].token == "faketoken"
+
+
+def test_build_runtime_proceeds_when_renewal_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token dead past the midnight-ET hard expiry (ADR-0002 point 1)
+    cannot be renewed non-interactively — renew_tokens() raising is the
+    EXPECTED case on a fresh morning, not a startup failure. build_runtime
+    must log and proceed with the original tokens; the downstream
+    EtradeClient.connect()/signed_session use is the real liveness check on
+    a truly dead token."""
+
+    def _failing_renew(tokens: oauth.OAuthTokens) -> oauth.OAuthTokens:
+        raise RuntimeError("simulated: renew_access_token returned 401")
+
+    monkeypatch.setattr("etrade_agent.server.app.oauth.renew_tokens", _failing_renew)
+    monkeypatch.setenv("ETRADE_CONSUMER_KEY", "fakekey")
+    monkeypatch.setenv("ETRADE_CONSUMER_SECRET", "fakesecret")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "fake-account-key")
+    path = _write_config(tmp_path)
+    tokens_dir = tmp_path / "tokens"
+    _save_fake_tokens(tokens_dir)
+
+    rt = build_runtime(path, tokens_dir)  # must not raise
+
+    assert isinstance(rt, Runtime)
